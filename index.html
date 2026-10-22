@@ -25,7 +25,7 @@
     -webkit-user-select: none; user-select: none; touch-action: manipulation; }
   #stage { position: fixed; inset: 0; background: #000; transition: padding 0.2s; }
   #stage.ring { padding: var(--ring, 18%); padding-top: calc(var(--ring, 18%) * 0.6 + var(--top));
-    padding-bottom: calc(var(--ring, 18%) + 236px + var(--bottom)); background: var(--light, #fff); }
+    padding-bottom: calc(var(--ring, 18%) + 274px + var(--bottom)); background: var(--light, #fff); }
   #view { width: 100%; height: 100%; display: block; border-radius: 0; }
   #stage.ring #view { border-radius: 18px; }
   #flash { position: fixed; inset: 0; background: var(--light, #fff); opacity: 0; pointer-events: none;
@@ -115,7 +115,8 @@
   <div id="bottom" class="bar">
     <div id="luts"></div>
     <div class="slrow"><span>Intensidade</span><input id="mix" type="range" min="0" max="100" value="100"><span id="mixval">100%</span></div>
-    <div class="slrow" id="pretorow"><span>Pretos (deslavar)</span><input id="preto" type="range" min="0" max="100" value="75"><span id="pretoval">75%</span></div>
+    <div class="slrow" id="pretorow"><span>Densidade de pretos</span><input id="preto" type="range" min="0" max="100" value="85"><span id="pretoval">85%</span></div>
+    <div class="slrow" id="calorrow"><span>Calor &amp; vida na pele</span><input id="calor" type="range" min="0" max="100" value="65"><span id="calorval">65%</span></div>
     <div id="modes"><button class="mode on" data-mode="foto">FOTO</button><button class="mode" data-mode="maxima">MÁXIMA</button><button class="mode" data-mode="video">VÍDEO</button></div>
     <div id="controls">
       <button id="b-gal" aria-label="Aplicar a LUT numa foto da galeria">🖼</button>
@@ -127,10 +128,11 @@
   <div id="cfg" class="sheet" hidden>
     <h3>Motor Raizen</h3>
     <p class="hint">O botão ao lado da Luz troca o modo: <b>AUTO</b> escolhe sozinho; <b>🌙 NOITE</b>
-      (ou com a Luz) faz rajada de 12 quadros, crava os pretos, tira a névoa do flash e o ruído, devolve a
-      cor da pele nos reflexos e dá volume e nitidez; <b>☀️ DIA</b> faz o mesmo, mais leve e sem rajada;
-      <b>SÓ LUT</b> entrega a foto idêntica ao .cube. O slider "Pretos" controla o quanto o preto é
-      cravado.</p>
+      (ou com a Luz) faz rajada de 12 quadros, tira o véu cinza, limpa a parede e as sombras, devolve a
+      cor da pele nos reflexos e dá nitidez só nas bordas (olhos, cabelo, tatuagem); <b>☀️ DIA</b> faz o
+      mesmo com limpeza mais leve e sem rajada; <b>SÓ LUT</b> entrega a foto idêntica ao .cube. O motor
+      nunca clareia sombra. "Densidade de pretos" dosa o anti-véu (85% = o padrão) e "Calor &amp; vida
+      na pele" tira o cinza frio da pele (65% = o padrão).</p>
     <p class="hint">A melhor foto sai no modo <b>MÁXIMA</b>: ele usa a câmera do próprio iPhone (foco,
       HDR e flash dela) e passa a foto pelo motor e pela LUT na resolução cheia. O botão 🖼 faz o mesmo
       com uma foto da galeria.</p>

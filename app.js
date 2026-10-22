@@ -240,11 +240,12 @@ class Renderer {
 }
 
 // ---------------------------------------------------------------- motor Raizen (GPU)
-// Etapas: 1 rajada alinhada e somada · 2 anti-lavado (ponto preto + névoa) ·
-// 3 ruído (luminância aqui; croma na baixa resolução) · 4 tom local (fusão de 3
-// exposições + contraste local) e reflexo do flash na pele · 5 nitidez em duas
-// bandas · 6 a LUT. A curva Raizen, a densidade subtrativa e o roll-off da pele
-// já estão dentro do .cube Raizen: o motor só os aplica sem LUT.
+// Etapas: 1 rajada alinhada e somada · 2 anti-véu (piso pelo percentil 12%, pé
+// denso) · 3 ruído (surface blur no Y aqui; croma na baixa resolução) · 4 só
+// comprime brilho (fusão da exposição base com a de gamma 1,55: nunca clareia
+// sombra) e o reflexo do flash na pele · 5 nitidez só em borda · calor da pele ·
+// 6 a LUT. A curva Raizen, a densidade subtrativa e o roll-off da pele já estão
+// dentro do .cube Raizen: o motor só os aplica sem LUT.
 const QUAD_VS = `#version 300 es
 in vec2 aPos;
 out vec2 vUv;
@@ -297,11 +298,12 @@ uniform sampler2D uSrc;
 uniform bool uAcc;
 uniform vec2 uStep;
 uniform int uN;
+uniform vec4 uRect;   // pedaço da foto lido (x0, y0, largura, altura em 0..1)
 in vec2 vUv;
 out vec4 o;
 void main() {
   vec4 s = vec4(0.0);
-  vec2 base = vUv - uStep * (float(uN) - 1.0) * 0.5;
+  vec2 base = uRect.xy + vUv * uRect.zw - uStep * (float(uN) - 1.0) * 0.5;
   for (int j = 0; j < 8; j++) {
     if (j >= uN) break;
     for (int i = 0; i < 8; i++) {
@@ -316,55 +318,89 @@ void main() {
   o = vec4(hi / 255.0, (y16 - hi * 256.0) / 255.0, (c.b - y) * 0.564 + 0.5, (c.r - y) * 0.713 + 0.5);
 }`;
 
-// 2. Anti-lavado: tira o véu cinza do preto (pé quadrático suave e reescala) e a
-// névoa do flash pelo canal escuro, só nas sombras e meios-tons baixos.
+// 2. Anti-véu (Deep Black Crush): a luminância vai do piso do véu ao branco de
+// referência, passa pelo pé denso (gamma 1,38 abaixo de 0,5) e pelo ombro que
+// protege a testa e o braço com flash. A cor acompanha a razão de luminância
+// com expoente 1/1,15: perde menos que o brilho, então fica mais densa ao escurecer.
 const PREP_FS = `#version 300 es
 precision highp float;
 uniform sampler2D uAcc;
-uniform float uBlack;
-uniform float uHaze;
+uniform float uFloor;
+uniform float uTop;
+uniform float uGamma;
 in vec2 vUv;
 out vec4 o;
 ${LUMA_GLSL}
-vec3 toe(vec3 x, float k) {
-  if (k <= 0.0) return x;
-  return mix(x * x / (4.0 * k), x - k, step(2.0 * k, x)) / (1.0 - k);
+float curva(float l) {
+  if (l < 0.5) return 0.5 * pow(2.0 * l, uGamma);
+  float t = (l - 0.5) * 2.0, k = uGamma - 1.0;   // ombro com a mesma inclinação em 0,5
+  return 0.5 + 0.5 * t * (1.0 + k) / (1.0 + k * t);
 }
 void main() {
   vec4 a = texture(uAcc, vUv);
-  vec3 c = toe(clamp(a.rgb / max(a.a, 1e-4), 0.0, 1.0), uBlack);
-  float dk = min(c.r, min(c.g, c.b));
-  float t = clamp(1.0 - 0.32 * dk, 0.35, 1.0);
-  vec3 j = (c - (1.0 - t)) / t;
-  float w = uHaze * (1.0 - smoothstep(0.45, 0.62, luma(c)));
-  o = vec4(clamp(mix(c, j, w), 0.0, 1.0), 1.0);
+  vec3 c = clamp(a.rgb / max(a.a, 1e-4), 0.0, 1.0);
+  float y = luma(c);
+  float lf = curva(clamp((y - uFloor) / (uTop - uFloor), 0.0, 1.0));
+  vec2 ch = vec2((c.b - y) * 0.564, (c.r - y) * 0.713) * pow(lf / max(y, 0.001), 1.0 / 1.15);
+  o = vec4(clamp(vec3(lf + 1.402 * ch.y, lf - 0.344136 * ch.x - 0.714136 * ch.y, lf + 1.772 * ch.x), 0.0, 1.0), 1.0);
 }`;
 
-// 3. Ruído de luminância: bilateral 5x5 só onde a região é lisa (parede, fundo,
-// sombra); em olho, cílio, barba e cabelo a imagem passa intacta.
-const DENOISE_FS = `#version 300 es
+// 3. Ruído de luminância: surface blur separável (raio 6 e depois 12, limiar 0,08)
+// no Y, em 4 passadas; a mistura só entra onde o Sobel do Y limpo diz que é liso
+// (parede, teto, pele lisa). Olho, cílio, barba, cabelo e tatuagem passam intactos.
+const BILAT_FS = `#version 300 es
 precision highp float;
 uniform sampler2D uSrc;
-uniform vec2 uTexel;
-uniform float uAmount;
+uniform bool uRgb;
+uniform vec2 uStep;
+uniform int uR;
 uniform float uRange;
 in vec2 vUv;
 out vec4 o;
 ${LUMA_GLSL}
 void main() {
-  vec3 c = texture(uSrc, vUv).rgb;
-  float y = luma(c);
-  float s = 0.0, ws = 0.0, mn = 1.0, mx = 0.0;
-  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
-    float yy = luma(texture(uSrc, vUv + vec2(i, j) * uTexel).rgb);
-    float d = yy - y;
-    float w = exp(-float(i * i + j * j) / 4.5 - d * d / (2.0 * uRange * uRange));
-    s += yy * w; ws += w;
-    mn = min(mn, yy); mx = max(mx, yy);
+  vec4 t0 = texture(uSrc, vUv);
+  float c = uRgb ? luma(t0.rgb) : t0.r;
+  float sig = max(1.0, float(uR) * 0.5), s = 0.0, ws = 0.0;
+  for (int i = -12; i <= 12; i++) {
+    if (i < -uR || i > uR) continue;
+    vec4 t = texture(uSrc, vUv + float(i) * uStep);
+    float v = uRgb ? luma(t.rgb) : t.r, d = v - c;
+    float w = exp(-float(i * i) / (2.0 * sig * sig) - d * d / (2.0 * uRange * uRange));
+    s += v * w; ws += w;
   }
-  float liso = 1.0 - smoothstep(0.06, 0.16, mx - mn);
-  float yd = mix(y, s / ws, uAmount * liso);
-  o = vec4(clamp(c + (yd - y), 0.0, 1.0), 1.0);
+  o = vec4(s / ws, 0.0, 0.0, 1.0);
+}`;
+
+const DENOISE_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform sampler2D uY;
+uniform vec2 uTexel;
+uniform float uAmount;
+uniform float uEdge;    // Sobel a partir do qual é borda (sobe com o ruído da foto)
+in vec2 vUv;
+out vec4 o;
+${LUMA_GLSL}
+void main() {
+  vec3 c = texture(uSrc, vUv).rgb;
+  float y = luma(c), yd = texture(uY, vUv).r;
+  // Sobel (convenção do OpenCV) no Y original com média 3x3: a média tira o grão
+  // da medida, mas fio de cabelo, cílio e tatuagem continuam sendo borda. (Medir
+  // no Y já limpo não serve: a limpeza apaga a textura e tudo parece liso.)
+  float v[25];
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++)
+    v[(j + 2) * 5 + i + 2] = luma(texture(uSrc, vUv + vec2(i, j) * uTexel).rgb);
+  float b[9];
+  for (int j = 0; j < 3; j++) for (int i = 0; i < 3; i++) {
+    float s = 0.0;
+    for (int q = 0; q < 3; q++) for (int p = 0; p < 3; p++) s += v[(j + q) * 5 + i + p];
+    b[j * 3 + i] = s / 9.0;
+  }
+  float gx = b[2] + 2.0 * b[5] + b[8] - b[0] - 2.0 * b[3] - b[6];
+  float gy = b[6] + 2.0 * b[7] + b[8] - b[0] - 2.0 * b[1] - b[2];
+  float liso = 1.0 - smoothstep(uEdge, uEdge + 0.10, length(vec2(gx, gy)));
+  o = vec4(clamp(c + (mix(y, yd, uAmount * liso) - y), 0.0, 1.0), 1.0);
 }`;
 
 // Desfoque gaussiano separável do Y (para a banda média da nitidez).
@@ -406,6 +442,7 @@ uniform float uChroma;
 uniform float uSharp;
 uniform float uSpec;
 uniform float uMix;
+uniform float uWarm;
 uniform bool uRaizen;
 ${LUT_GLSL}
 in vec2 vUv;
@@ -455,20 +492,24 @@ void main() {
           * smoothstep(0.15, 0.40, sk.x) * uSpec;
   ch = mix(ch, sk.yz - 0.5, 0.7 * m);
 
-  // Nitidez: banda fina (sigma 0,9) e média (0,9 a 2,2), com portão de ruído,
-  // freio nas sombras (Y < 25) e nos reflexos (Y > 215) e trava de contorno.
+  // Nitidez: banda fina (sigma 0,9) e média (0,9 a 2,2), só em borda de verdade
+  // (Sobel >= 0,12: olho, sobrancelha, cílio, cabelo, tatuagem), nunca abaixo de
+  // L 0,25 (fundo escuro) nem nos reflexos (acima de 215), com trava de contorno.
   float s09 = 0.0, w09 = 0.0, mn = 1.0, mx = 0.0;
+  float n3[9];
   for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
     float yy = luma(texture(uColor, vUv + vec2(i, j) * uTexel).rgb);
     float w = exp(-float(i * i + j * j) / 1.62);
     s09 += yy * w; w09 += w;
-    if (abs(i) <= 1 && abs(j) <= 1) { mn = min(mn, yy); mx = max(mx, yy); }
+    if (abs(i) <= 1 && abs(j) <= 1) { mn = min(mn, yy); mx = max(mx, yy); n3[(j + 1) * 3 + i + 1] = yy; }
   }
   float g09 = s09 / w09;
   float fine = y - g09, mid = g09 - texture(uBlur, vUv).r;
   fine *= abs(fine) / (abs(fine) + 0.004);
-  float gate = smoothstep(0.004, 0.02, abs(mid));
-  float brake = smoothstep(0.08, 0.13, y) * (1.0 - smoothstep(0.80, 0.86, y));
+  float gx = n3[2] + 2.0 * n3[5] + n3[8] - n3[0] - 2.0 * n3[3] - n3[6];
+  float gy = n3[6] + 2.0 * n3[7] + n3[8] - n3[0] - 2.0 * n3[1] - n3[2];
+  float gate = smoothstep(0.12, 0.18, length(vec2(gx, gy)));
+  float brake = smoothstep(0.25, 0.30, y) * (1.0 - smoothstep(0.80, 0.86, y));
   float tol = 0.08 * (mx - mn);
   float det = clamp((1.2 * fine + 0.6 * mid) * uSharp * gate * brake, mn - tol - y, mx + tol - y);
 
@@ -479,16 +520,28 @@ void main() {
     co *= 1.0 + 0.14 * (1.0 - smoothstep(0.0, 0.25, s));
     yo *= 1.0 - 0.05 * smoothstep(0.08, 0.25, s);
   }
+  // Calor e vida na pele: meios-tons (L 0,18 a 0,82) com R > B ganham +8% R,
+  // +3% G, -7% B, e os tons de pele (vermelho-laranja) +18% de saturação. uWarm 1
+  // = o slider em 65%.
+  float meio = smoothstep(0.14, 0.22, yo) * (1.0 - smoothstep(0.78, 0.86, yo));
+  float tomPele = smoothstep(-0.22, -0.18, co.x) * (1.0 - smoothstep(-0.01, 0.03, co.x))
+                * smoothstep(0.0, 0.04, co.y) * (1.0 - smoothstep(0.16, 0.20, co.y));
+  co *= 1.0 + 0.18 * uWarm * meio * tomPele;
   vec3 rgb = clamp(vec3(yo + 1.402 * co.y, yo - 0.344136 * co.x - 0.714136 * co.y, yo + 1.772 * co.x), 0.0, 1.0);
+  float k = uWarm * meio * smoothstep(0.0, 0.04, rgb.r - rgb.b);
+  rgb = clamp(rgb * vec3(1.0 + 0.08 * k, 1.0 + 0.03 * k, 1.0 - 0.07 * k), 0.0, 1.0);
   if (uRaizen) rgb = vec3(raizen(rgb.r), raizen(rgb.g), raizen(rgb.b));
   vec3 v = clamp(rgb + (applyLut(rgb) - rgb) * uMix, 0.0, 1.0);
   o = vec4(floor(v * 255.0 + 0.5) / 255.0, 1.0);
 }`;
 
 // Força de cada etapa: Noite (ou com a Luz) e Dia.
+// Noite (e Luz): o anti-véu e a limpeza exatamente como no bloco. Dia: anti-véu
+// a 60% e limpeza leve (numa foto clara o piso batia em 0,22, os olhos viravam
+// buracos pretos e a pele perdia a textura). Os sliders dosam os dois.
 const MOTOR = {
-  noite: { quadros: 12, preto: 1.0, nevoa: 1.0, ruidoY: 0.9, ruidoC: 0.9, fusao: 0.5, volume: 0.9, nitidez: 1.0, reflexo: 1.0 },
-  dia: { quadros: 1, preto: 0.7, nevoa: 0.45, ruidoY: 0.35, ruidoC: 0.55, fusao: 0.3, volume: 0.7, nitidez: 0.8, reflexo: 0.6 },
+  noite: { quadros: 12, veu: 1.0, ruidoY: 1.0, ruidoC: 1.0, fusao: 0.5, nitidez: 1.0, reflexo: 1.0 },
+  dia: { quadros: 1, veu: 0.6, ruidoY: 0.4, ruidoC: 0.7, fusao: 0.35, nitidez: 0.8, reflexo: 0.6 },
 };
 const BAIXA = 1024;   // lado maior da baixa resolução (tom local, croma, pele)
 
@@ -502,8 +555,9 @@ class Motor {
     this.float = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
     this.p = {
       acc: compile(gl, QUAD_VS, ACC_FS), stats: compile(gl, QUAD_VS, STATS_FS),
-      prep: compile(gl, QUAD_VS, PREP_FS), denoise: compile(gl, QUAD_VS, DENOISE_FS),
-      blur: compile(gl, QUAD_VS, BLUR_FS), fin: compile(gl, QUAD_VS, FINAL_FS),
+      prep: compile(gl, QUAD_VS, PREP_FS), bilat: compile(gl, QUAD_VS, BILAT_FS),
+      denoise: compile(gl, QUAD_VS, DENOISE_FS), blur: compile(gl, QUAD_VS, BLUR_FS),
+      fin: compile(gl, QUAD_VS, FINAL_FS),
     };
     quad(gl);
     rawPixels(gl);
@@ -603,10 +657,37 @@ class Motor {
       gl.uniform1i(u.uAcc, acc ? 1 : 0);
       gl.uniform1i(u.uN, n);
       gl.uniform2f(u.uStep, 1 / (small.w * n), 1 / (small.h * n));
+      gl.uniform4f(u.uRect, 0, 0, 1, 1);
     });
     const px = new Uint8Array(small.w * small.h * 4);
     gl.readPixels(0, 0, small.w, small.h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     return px;
+  }
+
+  // Ruído da foto (desvio do grão no Y): mediana do Laplaciano num recorte
+  // central em resolução cheia (estimador MAD, robusto às bordas).
+  noise(src) {
+    const gl = this.gl, n = Math.min(256, this.w, this.h), crop = this.target("crop", n, n, "rgba8");
+    this.run(this.p.stats, crop, (u) => {
+      this.tex(0, src.tex);
+      gl.uniform1i(u.uSrc, 0);
+      gl.uniform1i(u.uAcc, 0);
+      gl.uniform1i(u.uN, 1);
+      gl.uniform2f(u.uStep, 0, 0);
+      // começa num pixel inteiro: cada amostra cai no centro de um pixel (sem média)
+      gl.uniform4f(u.uRect, Math.floor((this.w - n) / 2) / this.w, Math.floor((this.h - n) / 2) / this.h,
+                   n / this.w, n / this.h);
+    });
+    const px = new Uint8Array(n * n * 4);
+    gl.readPixels(0, 0, n, n, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const Y = (i) => (px[i * 4] * 256 + px[i * 4 + 1]) / 65535, d = [];
+    for (let y = 1; y < n - 1; y++)
+      for (let x = 1; x < n - 1; x++) {
+        const i = y * n + x;
+        d.push(Math.abs(4 * Y(i) - Y(i - 1) - Y(i + 1) - Y(i - n) - Y(i + n)));
+      }
+    d.sort((a, b) => a - b);
+    return (1.4826 * d[d.length >> 1]) / Math.sqrt(20);
   }
 
   upload(tex, data, w, h) {
@@ -616,8 +697,9 @@ class Motor {
   }
 
   // Revela a foto somada: etapas 2 a 6. noite = true/false, ou null para decidir
-  // pelo brilho da cena. O resultado fica no canvas (w x h).
-  async develop({ noite = null, preto = 0.75, mix = 1, raizen = false } = {}) {
+  // pelo brilho da cena. preto e calor são os sliders (0..1). O resultado fica
+  // no canvas (w x h).
+  async develop({ noite = null, preto = 0.85, calor = 0.65, mix = 1, raizen = false } = {}) {
     await sleep(0);   // deixa a mensagem aparecer antes da conta pesada
     const gl = this.gl, w = this.w, h = this.h;
     gl.disable(gl.BLEND);
@@ -625,31 +707,54 @@ class Motor {
     const lw = Math.max(1, Math.round(w * k)), lh = Math.max(1, Math.round(h * k));
     const t0 = this.targets.t0, t1 = this.target("t1", w, h, "rgba16f"), small = this.target("small", lw, lh, "rgba8");
 
+    // Anti-véu: no Noite, com o slider em 85%, valem os números do bloco (piso =
+    // p12 x 0,62 entre 0,03 e 0,22; branco = p99,2, no mínimo 0,85; pé com gamma 1,38).
     const est = estatistica(this.readSmall(t0, small, true));
     const noturno = noite === null ? est.media < 0.22 : noite;
     const P = MOTOR[noturno ? "noite" : "dia"];
-    const black = Math.min(0.25, est.p015 * 1.17 * preto * P.preto);
-    const haze = Math.min(1, P.nevoa * preto / 0.75);
-
+    const s = (preto / 0.85) * P.veu;
+    const piso = Math.min(0.22, Math.max(0.03, est.p12 * 0.62)) * s;
+    const topo = 1 + (Math.max(est.p99, 0.85) - 1) * Math.min(1, s);
     this.run(this.p.prep, t1, (u) => {
       this.tex(0, t0.tex);
       gl.uniform1i(u.uAcc, 0);
-      gl.uniform1f(u.uBlack, black);
-      gl.uniform1f(u.uHaze, haze);
+      gl.uniform1f(u.uFloor, piso);
+      gl.uniform1f(u.uTop, topo);
+      gl.uniform1f(u.uGamma, 1 + 0.38 * s);
     });
+
+    // Surface blur do Y: raio 6 e depois 12, cada um na horizontal e na vertical.
+    // Limiar = 3x o ruído medido nesta foto, no máximo 0,08: tira o grão e deixa
+    // poro, fio e cílio (com 0,08 fixo, a pele e o cabelo viravam aquarela).
+    const ruido = this.noise(t1), limiar = Math.min(0.08, Math.max(0.012, 3 * ruido));
+    const ya = this.target("ya", w, h, "r16f"), yb = this.target("yb", w, h, "r16f");
+    const passes = [[t1, ya, true, 6, [1 / w, 0]], [ya, yb, false, 6, [0, 1 / h]],
+                    [yb, ya, false, 12, [1 / w, 0]], [ya, yb, false, 12, [0, 1 / h]]];
+    for (const [src, dst, rgb, r, step] of passes)
+      this.run(this.p.bilat, dst, (u) => {
+        this.tex(0, src.tex);
+        gl.uniform1i(u.uSrc, 0);
+        gl.uniform1i(u.uRgb, rgb ? 1 : 0);
+        gl.uniform2f(u.uStep, step[0], step[1]);
+        gl.uniform1i(u.uR, r);
+        gl.uniform1f(u.uRange, limiar);
+      });
     this.run(this.p.denoise, t0, (u) => {
       this.tex(0, t1.tex);
+      this.tex(1, yb.tex);
       gl.uniform1i(u.uSrc, 0);
+      gl.uniform1i(u.uY, 1);
       gl.uniform2f(u.uTexel, 1 / w, 1 / h);
       gl.uniform1f(u.uAmount, P.ruidoY);
-      gl.uniform1f(u.uRange, 0.03 + 0.03 * P.ruidoY);
+      // o grão depois da média 3x3 dá Sobel de ~1,15x o ruído: borda só bem acima disso
+      gl.uniform1f(u.uEdge, Math.max(0.10, 4 * ruido));
     });
 
     const mapas = mapasBaixos(this.readSmall(t0, small, false), lw, lh, P);
     this.upload(this.mapTex, mapas.map, lw, lh);
     this.upload(this.skinTex, mapas.pele, lw, lh);
 
-    const y1 = this.target("y1", w, h, "r16f"), y2 = this.target("y2", w, h, "r16f");
+    const y1 = ya, y2 = yb;   // reaproveita os alvos do surface blur
     for (const [src, dst, rgb, step] of [[t0, y1, true, [1 / w, 0]], [y1, y2, false, [0, 1 / h]]])
       this.run(this.p.blur, dst, (u) => {
         this.tex(0, src.tex);
@@ -678,9 +783,10 @@ class Motor {
       gl.uniform1f(u.uSharp, P.nitidez);
       gl.uniform1f(u.uSpec, P.reflexo);
       gl.uniform1f(u.uMix, mix);
+      gl.uniform1f(u.uWarm, calor / 0.65);
       gl.uniform1i(u.uRaizen, raizen ? 1 : 0);
     });
-    return { canvas: this.canvas, info: { noite: noturno, frames: this.frames, pretoAntes: est.p015, preto: black, media: est.media } };
+    return { canvas: this.canvas, info: { noite: noturno, frames: this.frames, piso, topo, p12: est.p12, media: est.media, ruido, limiar } };
   }
 
   release() {
@@ -695,7 +801,7 @@ class Motor {
 const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
 const janela = (v, a, b, e) => sstep(a - e, a + e, v) * (1 - sstep(b - e, b + e, v));
 
-// Ponto preto (percentil 1,5% do Y) e brilho médio.
+// Percentis 12% e 99,2% do Y (piso do véu e branco de referência) e brilho médio.
 function estatistica(px) {
   const hist = new Uint32Array(1024), n = px.length / 4;
   let soma = 0;
@@ -704,9 +810,12 @@ function estatistica(px) {
     soma += y;
     hist[Math.min(1023, (y * 1024) | 0)]++;
   }
-  let acc = 0, p = 0;
-  for (; p < 1023; p++) { acc += hist[p]; if (acc >= n * 0.015) break; }
-  return { p015: (p + 0.5) / 1024, media: soma / n };
+  const percentil = (q) => {
+    let acc = 0, p = 0;
+    for (; p < 1023; p++) { acc += hist[p]; if (acc >= n * q) break; }
+    return (p + 0.5) / 1024;
+  };
+  return { p12: percentil(0.12), p99: percentil(0.992), media: soma / n };
 }
 
 // Média móvel (2r+1) na horizontal e na vertical; 3 passadas ≈ gaussiana.
@@ -793,12 +902,13 @@ function up2(a, w2, h2, w, h) {
   return o;
 }
 
-// Fusão de exposições (Mertens): 3 exposições virtuais do Y (gamma 0,65, 1 e
-// 1,55), pesadas por contraste local e boa exposição (gaussiana em 0,52) e
+// Fusão de exposições (Mertens): a exposição base e a de gamma 1,55 (só para
+// baixo: a de 0,65, que clareava as sombras e trazia a névoa e o ruído de volta,
+// saiu), pesadas por contraste local e boa exposição (gaussiana em 0,52) e
 // misturadas em pirâmide de Laplace (sem costura nem halo).
 function fusao(Y, w, h) {
   const n = w * h;
-  const E = [0.65, 1, 1.55].map((g) => {
+  const E = [1, 1.55].map((g) => {
     if (g === 1) return Y;
     const e = new Float32Array(n);
     for (let i = 0; i < n; i++) e[i] = Math.pow(Y[i], g);
@@ -817,8 +927,8 @@ function fusao(Y, w, h) {
     return wt;
   });
   for (let i = 0; i < n; i++) {
-    const s = W[0][i] + W[1][i] + W[2][i];
-    W[0][i] /= s; W[1][i] /= s; W[2][i] /= s;
+    const s = W[0][i] + W[1][i];
+    W[0][i] /= s; W[1][i] /= s;
   }
   const niveis = Math.max(1, Math.floor(Math.log2(Math.min(w, h) / 8)));
   const piramide = (a) => {
@@ -830,7 +940,7 @@ function fusao(Y, w, h) {
   let out = null;
   for (let k = niveis - 1; k >= 0; k--) {
     const lw = GE[0][k].w, lh = GE[0][k].h, m = lw * lh, nivel = new Float32Array(m);
-    for (let e = 0; e < 3; e++) {
+    for (let e = 0; e < E.length; e++) {
       const g = GE[e][k].a, wk = GW[e][k].a;
       const prox = k < niveis - 1 ? up2(GE[e][k + 1].a, GE[e][k + 1].w, GE[e][k + 1].h, lw, lh) : null;
       for (let i = 0; i < m; i++) nivel[i] += wk[i] * (prox ? g[i] - prox[i] : g[i]);
@@ -859,16 +969,15 @@ function mapasBaixos(px, w, h, P) {
   const Yh = down2(Y, w, h), cbh = down2(cb, w, h), crh = down2(cr, w, h);
   const [cb2h, cr2h] = bilateralCroma(cbh.a, crh.a, Yh.a, Yh.w, Yh.h, 2.25, 0.08);
   const cb2 = up2(cb2h, Yh.w, Yh.h, w, h), cr2 = up2(cr2h, Yh.w, Yh.h, w, h);
-  // Tom local: fusão misturada ao original e contraste local limitado (tipo CLAHE).
-  const Yf = fusao(Y, w, h), Ym = new Float32Array(n);
-  for (let i = 0; i < n; i++) Ym[i] = Y[i] + P.fusao * (Yf[i] - Y[i]);
-  const grande = gaussAprox(Ym, w, h, Math.max(w, h) / 40);
+  // Tom: fusão misturada ao original, sem contraste local (o CLAHE lavava os
+  // pretos). O ganho nunca passa de 1: o motor não clareia sombra.
+  const Yf = fusao(Y, w, h);
   const map = new Float32Array(n * 4), pele = new Float32Array(n * 4);
   const sw = new Float32Array(n), swb = new Float32Array(n), swr = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    const yl = Ym[i] + P.volume * 0.8 * 0.08 * Math.tanh((Ym[i] - grande[i]) / 0.08);
+    const yl = Y[i] + P.fusao * (Yf[i] - Y[i]);
     const cbD = 0.5 * (cb1[i] + cb2[i]), crD = 0.5 * (cr1[i] + cr2[i]);
-    map[i * 4] = Math.min(4, Math.max(0.25, yl / Math.max(Y[i], 0.004)));
+    map[i * 4] = Math.min(1, Math.max(0.25, yl / Math.max(Y[i], 0.004)));
     map[i * 4 + 1] = Y[i];
     map[i * 4 + 2] = cbD;
     map[i * 4 + 3] = crD;
@@ -1054,32 +1163,35 @@ const MODOS = ["auto", "noite", "dia", "lut"];
 const ROTULO = { auto: "AUTO", noite: "🌙 NOITE", dia: "☀️ DIA", lut: "SÓ LUT" };
 const AVISO = {
   auto: "Auto: o app escolhe Noite (cena escura ou com a Luz) ou Dia.",
-  noite: "🌙 Noite / Flash Raizen 6.1 (anti-lavado): rajada de 12 quadros, pretos cravados, ruído limpo e volume.",
-  dia: "☀️ Dia / luz natural: pretos, limpeza leve, volume e nitidez.",
+  noite: "🌙 Noite / Flash Raizen 6.1 (anti-lavado): rajada de 12 quadros, véu tirado, parede limpa e nitidez só nas bordas.",
+  dia: "☀️ Dia / luz natural: véu tirado, limpeza mais leve e nitidez só nas bordas.",
   lut: "Só LUT: a foto sai idêntica ao .cube, sem o motor.",
 };
 const state = {
   facing: "user", mode: "foto", light: false, kelvin: 5600, ring: 18, mirror: true,
   mix: 1, lutId: "raizen-33", recording: false, compare: false, last: null, busy: false,
-  modo: "auto", preto: 0.75,
+  modo: "auto", preto: 0.85, calor: 0.65,
 };
 const luts = new Map();      // id -> {id, name, size, data, builtin}
 let view, out, motor = null, stream = null, recorder = null, chunks = [], recStart = 0, audioStream = null;
 const cam = $("#cam");
 let testImage = null;
 
-// "prefs3": as versões anteriores guardavam o HDR+ e a Definição/Nitidez antigos.
+// "prefs4": o slider Pretos mudou de escala (85% = o anti-véu do bloco); do
+// "prefs3" só vêm a luz, o espelho e o modo.
 function loadPrefs() {
   try {
-    const p = JSON.parse(localStorage.getItem("prefs3") || "{}");
-    for (const k of ["kelvin", "ring", "mirror", "modo", "preto"]) if (k in p) state[k] = p[k];
+    const velho = JSON.parse(localStorage.getItem("prefs3") || "{}");
+    const p = { kelvin: velho.kelvin, ring: velho.ring, mirror: velho.mirror, modo: velho.modo,
+                ...JSON.parse(localStorage.getItem("prefs4") || "{}") };
+    for (const k of ["kelvin", "ring", "mirror", "modo", "preto", "calor"]) if (p[k] !== undefined) state[k] = p[k];
     if (!MODOS.includes(state.modo)) state.modo = "auto";
   } catch {}
 }
 function savePrefs() {
   try {
-    const { kelvin, ring, mirror, modo, preto } = state;
-    localStorage.setItem("prefs3", JSON.stringify({ kelvin, ring, mirror, modo, preto }));
+    const { kelvin, ring, mirror, modo, preto, calor } = state;
+    localStorage.setItem("prefs4", JSON.stringify({ kelvin, ring, mirror, modo, preto, calor }));
   } catch {}
 }
 
@@ -1282,11 +1394,11 @@ async function importFiles(files) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
 const motorAtivo = () => state.modo !== "lut" && !!motor && motor.float;
-const opcoesMotor = () => ({ preto: state.preto, mix: state.mix, raizen: state.lutId === "none" });
+const opcoesMotor = () => ({ preto: state.preto, calor: state.calor, mix: state.mix, raizen: state.lutId === "none" });
 
 function notaMotor(info) {
   const q = info.frames > 1 ? ` · ${info.frames} quadros` : "";
-  return `${info.noite ? "🌙 Noite" : "☀️ Dia"}${q} · preto ${Math.round(info.pretoAntes * 255)} → 0`;
+  return `${info.noite ? "🌙 Noite" : "☀️ Dia"}${q} · véu de ${Math.round(info.piso * 255)} tirado`;
 }
 
 async function takePhoto() {
@@ -1587,9 +1699,11 @@ function syncUi() {
   $("#mirror").checked = state.mirror;
   $("#preto").value = Math.round(state.preto * 100);
   $("#pretoval").textContent = Math.round(state.preto * 100) + "%";
+  $("#calor").value = Math.round(state.calor * 100);
+  $("#calorval").textContent = Math.round(state.calor * 100) + "%";
   $("#b-modo").textContent = ROTULO[state.modo];
   $("#b-modo").classList.toggle("on", state.modo !== "lut");
-  $("#pretorow").hidden = state.modo === "lut";
+  $("#pretorow").hidden = $("#calorrow").hidden = state.modo === "lut";
 }
 
 function bindUi() {
@@ -1618,6 +1732,7 @@ function bindUi() {
     else msg(AVISO[state.modo], 4000);
   };
   $("#preto").oninput = (e) => { state.preto = +e.target.value / 100; syncUi(); savePrefs(); };
+  $("#calor").oninput = (e) => { state.calor = +e.target.value / 100; syncUi(); savePrefs(); };
   $("#b-gal").onclick = () => { if (!state.busy) $("#galeria").click(); };
   for (const id of ["#nativa", "#galeria"])
     $(id).onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; processPhotoFile(f); };
@@ -1788,14 +1903,37 @@ function lumaStats(data) {
 }
 
 // Uma foto sintética pelo motor: n quadros da rajada de teste, alinhados e somados.
-async function runMotor(n, noite) {
+async function runMotor(n, noite, extra = {}) {
   const [w, h] = sourceSize(), ref = testBurstFrame(0);
   motor.begin(ref, w, h, {});
   const align = n > 1 ? makeAligner(ref, w, h) : null;
   for (let i = 1; i < n; i++) { const cur = testBurstFrame(i); const { dx, dy } = align(cur); motor.add(cur, dx, dy); }
   const t0 = performance.now();
-  const r = await motor.develop({ noite, preto: 0.75, mix: 1, raizen: false });
+  const r = await motor.develop({ noite, preto: 0.85, calor: 0.65, mix: 1, raizen: false, ...extra });
   return { data: readCanvas(r.canvas), info: r.info, ms: Math.round(performance.now() - t0) };
+}
+
+// Regra 1: o motor nunca clareia sombra. Sem LUT e sem o calor, conta os pixels
+// de sombra (Y < 0,3 na entrada) que saíram mais claros (mais de 2 níveis).
+async function verifySombras() {
+  await selectLut("none");
+  Object.assign(testBurstFrame, { noise: 0, veu: { lift: 34, ganho: 0.85 } });
+  const entrada = readCanvas(testBurstFrame(0));
+  const saida = (await runMotor(1, true, { calor: 0 })).data;
+  Object.assign(testBurstFrame, { noise: 0, veu: null });
+  motor.release();
+  await selectLut("raizen-33");
+  const Y = (d, k) => 0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2];
+  let sombras = 0, clareadas = 0, queda = 0;
+  for (let k = 0; k < entrada.length; k += 4) {
+    const yi = Y(entrada, k);
+    if (yi >= 0.3 * 255) continue;
+    sombras++;
+    const d = Y(saida, k) - yi;
+    if (d > 2) clareadas++;
+    queda += d;
+  }
+  return { sombras, clareadas, quedaMedia: +(queda / sombras).toFixed(1) };
 }
 
 async function verifyMotor() {
@@ -1844,7 +1982,7 @@ async function main() {
   if (TEST) {
     testImage = await loadImage("teste/amostra.png");
     Object.assign(window, { __verificar: verify, __testarMaxima: verifyNative, __testarMotor: verifyMotor,
-                            __estado: state });
+                            __testarSombras: verifySombras, __estado: state });
   }
   await selectLut(saved);
   applyLight();
