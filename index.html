@@ -39,6 +39,11 @@
     align-items: center; justify-content: center; gap: 6px; backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px); }
   .btn.on { background: var(--accent); color: #111; }
+  .grp { display: flex; gap: 8px; }
+  #res { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap;
+    text-shadow: 0 1px 3px #000; }
+  select { background: #2a2b30; color: var(--fg); border: 0; border-radius: 8px; padding: 6px 10px;
+    font: inherit; font-size: 13px; }
   #bottom { bottom: 0; padding-bottom: calc(var(--bottom) + 14px); flex-direction: column; gap: 12px; }
   #luts { display: flex; gap: 8px; overflow-x: auto; width: 100%; padding: 2px 2px 4px;
     scrollbar-width: none; }
@@ -71,7 +76,8 @@
     z-index: 21; font-variant-numeric: tabular-nums; }
   .sheet { position: fixed; left: 12px; right: 12px; bottom: calc(var(--bottom) + 12px); z-index: 40;
     background: rgba(24, 25, 29, 0.96); border-radius: 18px; padding: 16px; display: flex;
-    flex-direction: column; gap: 12px; box-shadow: 0 10px 40px #000a; }
+    flex-direction: column; gap: 12px; box-shadow: 0 10px 40px #000a;
+    max-height: calc(100% - var(--top) - var(--bottom) - 24px); overflow-y: auto; }
   .sheet h3 { margin: 0; font-size: 15px; }
   .sheet label { display: flex; align-items: center; justify-content: space-between; gap: 12px;
     font-size: 13px; color: var(--muted); }
@@ -90,9 +96,15 @@
   <div id="flash"></div>
 
   <div id="topbar" class="bar">
-    <button id="b-flash" class="btn" aria-label="Flash frontal">⚡ Luz</button>
-    <button id="b-cfg" class="btn" aria-label="Ajustes">⚙</button>
-    <button id="b-flip" class="btn" aria-label="Trocar câmera">⟲</button>
+    <div class="grp">
+      <button id="b-flash" class="btn" aria-label="Flash frontal">⚡ Luz</button>
+      <button id="b-hd" class="btn" aria-label="Qualidade da foto">HD</button>
+    </div>
+    <span id="res"></span>
+    <div class="grp">
+      <button id="b-cfg" class="btn" aria-label="Ajustes">⚙</button>
+      <button id="b-flip" class="btn" aria-label="Trocar câmera">⟲</button>
+    </div>
   </div>
   <div id="timer" hidden>00:00</div>
 
@@ -107,6 +119,21 @@
   </div>
 
   <div id="cfg" class="sheet" hidden>
+    <h3>Qualidade da foto</h3>
+    <label>HDR+ (rajada)
+      <select id="hdr">
+        <option value="1">Desligado</option>
+        <option value="4">4 quadros</option>
+        <option value="8">8 quadros</option>
+      </select>
+    </label>
+    <label>Definição <span id="dval">30%</span></label>
+    <input id="def" type="range" min="0" max="100" value="30">
+    <label>Nitidez <span id="sval">30%</span></label>
+    <input id="sharp" type="range" min="0" max="100" value="30">
+    <p class="hint">O HDR+ tira vários quadros seguidos, alinha um com o outro e soma: o ruído cai e as
+      sombras ganham detalhe. Segure firme por meio segundo. A Definição tira o aspecto lavado; a Nitidez
+      realça a borda fina. Com tudo desligado, a foto sai idêntica ao .cube.</p>
     <h3>Luz da tela (frontal)</h3>
     <label>Temperatura <span id="kval">5000 K</span></label>
     <input id="kelvin" type="range" min="2700" max="7500" step="100" value="5000">
