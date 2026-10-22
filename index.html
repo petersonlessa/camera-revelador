@@ -25,7 +25,7 @@
     -webkit-user-select: none; user-select: none; touch-action: manipulation; }
   #stage { position: fixed; inset: 0; background: #000; transition: padding 0.2s; }
   #stage.ring { padding: var(--ring, 18%); padding-top: calc(var(--ring, 18%) * 0.6 + var(--top));
-    padding-bottom: calc(var(--ring, 18%) + 150px + var(--bottom)); background: var(--light, #fff); }
+    padding-bottom: calc(var(--ring, 18%) + 196px + var(--bottom)); background: var(--light, #fff); }
   #view { width: 100%; height: 100%; display: block; border-radius: 0; }
   #stage.ring #view { border-radius: 18px; }
   #flash { position: fixed; inset: 0; background: var(--light, #fff); opacity: 0; pointer-events: none;
@@ -56,8 +56,11 @@
   #mixrow { display: flex; align-items: center; gap: 10px; width: 100%; font-size: 12px; color: var(--muted); }
   input[type=range] { flex: 1; accent-color: var(--accent); }
   #controls { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; width: 100%; }
-  #modes { display: flex; gap: 2px; justify-self: start; background: var(--panel); border-radius: 999px;
-    padding: 2px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  #modes { display: flex; gap: 6px; align-self: center; background: var(--panel); border-radius: 999px;
+    padding: 2px 10px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+  #b-gal { justify-self: start; width: 48px; height: 48px; border-radius: 50%; border: 0; padding: 0;
+    background: var(--panel); color: var(--fg); font-size: 22px; backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px); }
   #mixrow { background: var(--panel); border-radius: 999px; padding: 4px 12px;
     backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
   .mode { background: none; border: 0; color: var(--muted); font: inherit; font-weight: 700;
@@ -68,6 +71,7 @@
   #shutter span { display: block; width: 100%; height: 100%; border-radius: 50%; background: #fff;
     transition: all 0.15s; }
   #shutter.video span { background: var(--rec); }
+  #shutter.maxima span { background: var(--accent); }
   #shutter.recording span { border-radius: 8px; transform: scale(0.55); }
   #thumb { justify-self: end; width: 48px; height: 48px; border-radius: 10px; border: 2px solid #fff;
     background: #222 center/cover no-repeat; padding: 0; }
@@ -96,10 +100,7 @@
   <div id="flash"></div>
 
   <div id="topbar" class="bar">
-    <div class="grp">
-      <button id="b-flash" class="btn" aria-label="Flash frontal">⚡ Luz</button>
-      <button id="b-hd" class="btn" aria-label="Qualidade da foto">HD</button>
-    </div>
+    <button id="b-flash" class="btn" aria-label="Flash frontal">⚡ Luz</button>
     <span id="res"></span>
     <div class="grp">
       <button id="b-cfg" class="btn" aria-label="Ajustes">⚙</button>
@@ -111,8 +112,9 @@
   <div id="bottom" class="bar">
     <div id="luts"></div>
     <div id="mixrow"><span>Intensidade</span><input id="mix" type="range" min="0" max="100" value="100"><span id="mixval">100%</span></div>
+    <div id="modes"><button class="mode on" data-mode="foto">FOTO</button><button class="mode" data-mode="maxima">MÁXIMA</button><button class="mode" data-mode="video">VÍDEO</button></div>
     <div id="controls">
-      <div id="modes"><button class="mode on" data-mode="foto">FOTO</button><button class="mode" data-mode="video">VÍDEO</button></div>
+      <button id="b-gal" aria-label="Aplicar a LUT numa foto da galeria">🖼</button>
       <button id="shutter" aria-label="Disparar"><span></span></button>
       <button id="thumb" aria-label="Última captura"></button>
     </div>
@@ -120,6 +122,10 @@
 
   <div id="cfg" class="sheet" hidden>
     <h3>Qualidade da foto</h3>
+    <p class="hint">A melhor foto sai no modo <b>MÁXIMA</b>: ele usa a câmera do próprio iPhone (foco,
+      HDR, Deep Fusion e flash dela) e aplica a LUT logo depois, na resolução cheia. O botão 🖼 faz o
+      mesmo com uma foto que já está na galeria.</p>
+    <p class="hint">Os ajustes abaixo valem só no modo FOTO, que usa a imagem do visor.</p>
     <label>HDR+ (rajada)
       <select id="hdr">
         <option value="1">Desligado</option>
@@ -127,13 +133,12 @@
         <option value="8">8 quadros</option>
       </select>
     </label>
-    <label>Definição <span id="dval">30%</span></label>
-    <input id="def" type="range" min="0" max="100" value="30">
-    <label>Nitidez <span id="sval">30%</span></label>
-    <input id="sharp" type="range" min="0" max="100" value="30">
-    <p class="hint">O HDR+ tira vários quadros seguidos, alinha um com o outro e soma: o ruído cai e as
-      sombras ganham detalhe. Segure firme por meio segundo. A Definição tira o aspecto lavado; a Nitidez
-      realça a borda fina. Com tudo desligado, a foto sai idêntica ao .cube.</p>
+    <label>Definição <span id="dval">0%</span></label>
+    <input id="def" type="range" min="0" max="100" value="0">
+    <label>Nitidez <span id="sval">0%</span></label>
+    <input id="sharp" type="range" min="0" max="100" value="0">
+    <p class="hint">O HDR+ só funciona com o celular apoiado e a cena parada: na mão, ele borra a foto.
+      Com tudo desligado, a foto sai idêntica ao .cube.</p>
     <h3>Luz da tela (frontal)</h3>
     <label>Temperatura <span id="kval">5000 K</span></label>
     <input id="kelvin" type="range" min="2700" max="7500" step="100" value="5000">
@@ -157,6 +162,8 @@
 
   <div id="msg" hidden></div>
   <input id="file" type="file" accept=".cube,text/plain,application/octet-stream" multiple hidden>
+  <input id="nativa" type="file" accept="image/*" capture="environment" hidden>
+  <input id="galeria" type="file" accept="image/*" hidden>
   <video id="cam" playsinline muted autoplay hidden></video>
   <script src="app.js"></script>
 </body>

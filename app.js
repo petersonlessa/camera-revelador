@@ -39,12 +39,24 @@ const VERT = `#version 300 es
 in vec2 aPos;
 uniform vec4 uCrop;      // x0, y0, largura, altura na textura (0..1)
 uniform bool uMirror;
+uniform int uOrient;     // orientação EXIF da foto gravada (1 = já de pé)
 out vec2 vUv;
+// De um ponto da foto de pé (d, y para baixo) para o ponto na foto como foi gravada.
+vec2 orient(vec2 d) {
+  if (uOrient == 2) return vec2(1.0 - d.x, d.y);
+  if (uOrient == 3) return vec2(1.0 - d.x, 1.0 - d.y);
+  if (uOrient == 4) return vec2(d.x, 1.0 - d.y);
+  if (uOrient == 5) return d.yx;
+  if (uOrient == 6) return vec2(d.y, 1.0 - d.x);
+  if (uOrient == 7) return vec2(1.0 - d.y, 1.0 - d.x);
+  if (uOrient == 8) return vec2(1.0 - d.y, d.x);
+  return d;
+}
 void main() {
   vec2 uv = aPos * 0.5 + 0.5;
   uv.y = 1.0 - uv.y;
   if (uMirror) uv.x = 1.0 - uv.x;
-  vUv = uCrop.xy + uv * uCrop.zw;
+  vUv = uCrop.xy + orient(uv) * uCrop.zw;
   gl_Position = vec4(aPos, 0.0, 1.0);
 }`;
 
@@ -199,7 +211,7 @@ class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
   }
 
-  draw(source, { crop = [0, 0, 1, 1], mirror = false, mix = 1 } = {}) {
+  draw(source, { crop = [0, 0, 1, 1], mirror = false, mix = 1, orient = 1 } = {}) {
     const gl = this.gl;
     gl.useProgram(this.p.prog);
     gl.activeTexture(gl.TEXTURE0);
@@ -210,6 +222,7 @@ class Renderer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.uniform4f(this.p.u.uCrop, crop[0], crop[1], crop[2], crop[3]);
     gl.uniform1i(this.p.u.uMirror, mirror ? 1 : 0);
+    gl.uniform1i(this.p.u.uOrient, orient);
     gl.uniform1i(this.p.u.uSize, this.lutSize);
     gl.uniform1f(this.p.u.uMix, mix);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -647,23 +660,24 @@ const BUILTIN = [
 const state = {
   facing: "user", mode: "foto", light: false, kelvin: 5000, ring: 18, mirror: true,
   mix: 1, lutId: "raizen-33", recording: false, compare: false, last: null, busy: false,
-  hdr: 4, def: 0.3, sharp: 0.3,
+  hdr: 1, def: 0, sharp: 0,
 };
 const luts = new Map();      // id -> {id, name, size, data, builtin}
 let view, out, proc = null, stream = null, recorder = null, chunks = [], recStart = 0, audioStream = null;
 const cam = $("#cam");
 let testImage = null, testSource = null;
 
+// "prefs2": a versão anterior guardava o HDR+ ligado como padrão, que borrava a foto na mão.
 function loadPrefs() {
   try {
-    const p = JSON.parse(localStorage.getItem("prefs") || "{}");
+    const p = JSON.parse(localStorage.getItem("prefs2") || "{}");
     for (const k of ["kelvin", "ring", "mirror", "hdr", "def", "sharp"]) if (k in p) state[k] = p[k];
   } catch {}
 }
 function savePrefs() {
   try {
     const { kelvin, ring, mirror, hdr, def, sharp } = state;
-    localStorage.setItem("prefs", JSON.stringify({ kelvin, ring, mirror, hdr, def, sharp }));
+    localStorage.setItem("prefs2", JSON.stringify({ kelvin, ring, mirror, hdr, def, sharp }));
   } catch {}
 }
 
@@ -702,11 +716,9 @@ function applyLight() {
 async function startCamera() {
   if (TEST) { showRes(); return; }
   if (stream) stream.getTracks().forEach((t) => t.stop());
-  // Foto: pede o formato 4:3 de 12 MP; vídeo: 16:9 até 1080p (o visor grava até 1920 px).
-  const video = state.mode === "foto"
-    ? { facingMode: state.facing, width: { ideal: 4032 }, height: { ideal: 3024 }, aspectRatio: { ideal: 4 / 3 },
-        frameRate: { ideal: 30 } }
-    : { facingMode: state.facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+  // O formato 4K 16:9 de vídeo, o mesmo da gravação em 4K. (A versão que pedia o 4:3 de
+  // 12 MP deu foto pior no iPhone.) A gravação do visor reduz para 1920 px.
+  const video = { facingMode: state.facing, width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } };
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
   } catch (e) {
@@ -726,9 +738,11 @@ async function startCamera() {
 function showRes() {
   const [w, h] = sourceSize();
   if (!w) return;
-  $("#res").textContent = `${(w * h / 1e6).toFixed(1)} MP`;
+  $("#res").textContent = `${mp(w, h)} MP`;
   $("#res").title = `${w}×${h}`;
 }
+
+const mp = (w, h) => (w * h / 1e6).toFixed(1).replace(".", ",");
 
 function sourceSize() {
   if (TEST && testImage) return [testImage.naturalWidth, testImage.naturalHeight];
@@ -922,6 +936,127 @@ async function grab(i = 0) {
   return testBurstFrame(i);
 }
 
+// ---------------------------------------------------------------- MÁXIMA e galeria
+// A foto vem da câmera do próprio iPhone (foco, HDR, Deep Fusion e o flash dela)
+// ou da galeria; a LUT entra depois, pixel a pixel, na resolução cheia.
+const MAX_PIXELS = 16777216;   // maior canvas que o Safari do iPhone aceita (16,7 MP)
+
+// JPEG mínimo 16x8 (metade esquerda vermelha, direita azul) com EXIF 6: gerado
+// pelo gerar_recursos.py para descobrir se o navegador já gira a foto sozinho.
+const ORIENT_TEST = "/9j/4AAQSkZJRgABAQAAAQABAAD/4QAiRXhpZgAATU0AKgAAAAgAAQESAAMAAAABAAYAAAAAAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAAIABADAREAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD8X6/ynP8Av4PyHr/1UD/zXz//2Q==";
+
+async function loadImage(src) {
+  const img = new Image();
+  img.src = src;
+  await img.decode();
+  return img;
+}
+
+// O navegador já entrega a foto de pé quando ela vai para a GPU? Desenha a imagem
+// de teste num quadro 2x2: vermelho no canto de cima à direita = já girou.
+let rotatesP = null;
+function browserRotates() {
+  return rotatesP || (rotatesP = (async () => {
+    const img = await loadImage("data:image/jpeg;base64," + ORIENT_TEST);
+    out.resize(2, 2);
+    out.smooth(false);
+    out.draw(img, { mix: 0 });
+    const px = new Uint8Array(4);
+    out.gl.readPixels(1, 1, 1, 1, out.gl.RGBA, out.gl.UNSIGNED_BYTE, px);
+    return px[0] > px[2];
+  })());
+}
+
+// Orientação EXIF e tamanho gravado de um JPEG (null se não for JPEG).
+async function jpegInfo(blob) {
+  const v = new DataView(await blob.slice(0, 262144).arrayBuffer());
+  if (v.byteLength < 4 || v.getUint16(0) !== 0xffd8) return null;
+  let orient = 1, p = 2;
+  while (p + 4 <= v.byteLength && v.getUint8(p) === 0xff) {
+    const m = v.getUint8(p + 1);
+    if (m === 0xff) { p++; continue; }
+    if (m === 0xd9 || m === 0xda) break;          // fim ou início dos dados: o tamanho vem antes
+    const len = v.getUint16(p + 2);
+    if (m === 0xe1 && p + 10 <= v.byteLength && v.getUint32(p + 4) === 0x45786966) orient = exifOrient(v, p + 10);
+    const sof = m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc;
+    if (sof && p + 9 <= v.byteLength) return { orient, w: v.getUint16(p + 7), h: v.getUint16(p + 5) };
+    p += 2 + len;
+  }
+  return null;
+}
+
+function exifOrient(v, t) {
+  if (t + 8 > v.byteLength) return 1;
+  const le = v.getUint16(t) === 0x4949;
+  const ifd = t + v.getUint32(t + 4, le);
+  if (ifd + 2 > v.byteLength) return 1;
+  for (let i = 0, n = v.getUint16(ifd, le); i < n; i++) {
+    const e = ifd + 2 + i * 12;
+    if (e + 12 > v.byteLength) break;
+    if (v.getUint16(e, le) === 0x0112) {
+      const o = v.getUint16(e + 8, le);
+      return o >= 1 && o <= 8 ? o : 1;
+    }
+  }
+  return 1;
+}
+
+// A foto (arquivo) de pé e com a LUT, no canvas de saída. Devolve o canvas e o tamanho.
+async function lutPhoto(blob, { forceOrient = 0 } = {}) {
+  const info = await jpegInfo(blob);
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await loadImage(url);
+    let w = img.naturalWidth, h = img.naturalHeight, orient = 1;
+    if (info) {
+      const turn = forceOrient || info.orient;
+      [w, h] = turn >= 5 ? [info.h, info.w] : [info.w, info.h];
+      orient = forceOrient || ((await browserRotates()) ? 1 : info.orient);
+    }
+    const k = Math.min(1, Math.sqrt(MAX_PIXELS / (w * h)));
+    const ow = Math.floor(w * k), oh = Math.floor(h * k);
+    out.resize(ow, oh);
+    out.smooth(k < 1);
+    out.draw(img, { orient, mix: state.mix });
+    return { canvas: out.canvas, w: ow, h: oh, original: [w, h] };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function processPhotoFile(file) {
+  if (!file || state.busy) return;
+  state.busy = true;
+  msg("Aplicando a LUT na foto…", 0);
+  try {
+    const r = await lutPhoto(file);
+    const blob = await new Promise((ok) => r.canvas.toBlob(ok, "image/jpeg", 0.95));
+    $("#msg").hidden = true;
+    showResult(blob, `Revelador_${stamp()}.jpg`, "image/jpeg");
+    const reduzida = r.w !== r.original[0] ? " (reduzida: o Safari não passa de 16,7 MP)" : "";
+    msg(`Foto de ${mp(r.w, r.h)} MP com a LUT${reduzida}.`, 3500);
+  } catch (e) {
+    msg("Não deu para abrir essa foto: " + e.message, 5000);
+  } finally {
+    state.busy = false;
+    ensureCamera();
+  }
+}
+
+function openNative() {
+  if (state.busy) return;
+  const inp = $("#nativa");
+  inp.setAttribute("capture", state.facing);
+  inp.click();
+}
+
+// Volta o visor depois que a câmera do iPhone foi usada.
+function ensureCamera() {
+  if (TEST) return;
+  const t = stream && stream.getVideoTracks()[0];
+  if (!t || t.readyState !== "live" || t.muted) startCamera();
+}
+
 // ---------------------------------------------------------------- vídeo
 async function startVideo() {
   if (!ready() || !window.MediaRecorder || !out.canvas.captureStream) {
@@ -1011,25 +1146,28 @@ function syncPhotoUi() {
   $("#kelvin").value = state.kelvin;
   $("#ringsize").value = state.ring;
   $("#mirror").checked = state.mirror;
-  $("#b-hd").classList.toggle("on", enhanced());
-  $("#b-hd").textContent = state.hdr > 1 ? `HDR+ ${state.hdr}` : enhanced() ? "HD" : "HD off";
 }
 
 function bindUi() {
   $("#shutter").onclick = () => {
     if (state.mode === "foto") takePhoto();
+    else if (state.mode === "maxima") openNative();
     else if (state.recording) stopVideo();
     else startVideo();
   };
-  document.querySelectorAll(".mode").forEach((b) => (b.onclick = async () => {
+  document.querySelectorAll(".mode").forEach((b) => (b.onclick = () => {
     if (state.recording || state.busy || state.mode === b.dataset.mode) return;
     state.mode = b.dataset.mode;
     document.querySelectorAll(".mode").forEach((x) => x.classList.toggle("on", x === b));
     $("#shutter").classList.toggle("video", state.mode === "video");
-    $("#b-hd").hidden = state.mode !== "foto";
+    $("#shutter").classList.toggle("maxima", state.mode === "maxima");
     applyLight();
-    await startCamera();
+    if (state.mode === "maxima")
+      msg("MÁXIMA: o disparo abre a câmera do iPhone (foco, HDR e flash dela). A LUT entra logo depois, na resolução cheia.", 5000);
   }));
+  $("#b-gal").onclick = () => { if (!state.busy) $("#galeria").click(); };
+  for (const id of ["#nativa", "#galeria"])
+    $(id).onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; processPhotoFile(f); };
   $("#b-flip").onclick = async () => {
     if (state.recording || state.busy) return;
     state.facing = state.facing === "user" ? "environment" : "user";
@@ -1039,10 +1177,10 @@ function bindUi() {
   $("#b-flash").onclick = () => {
     state.light = !state.light;
     applyLight();
-    if (state.light && state.facing !== "user") msg("A luz da tela serve para a câmera frontal.");
+    if (state.light && state.mode === "maxima") msg("Na MÁXIMA, use o flash da própria câmera do iPhone (o raio no canto).");
+    else if (state.light && state.facing !== "user") msg("A luz da tela serve para a câmera frontal.");
     else if (state.light) msg("Luz ligada. Brilho do iPhone no máximo!");
   };
-  $("#b-hd").onclick = () => ($("#cfg").hidden = false);
   $("#b-cfg").onclick = () => ($("#cfg").hidden = false);
   $("#b-cfg-close").onclick = () => ($("#cfg").hidden = true);
   $("#kelvin").oninput = (e) => { state.kelvin = +e.target.value; applyLight(); savePrefs(); };
@@ -1062,7 +1200,7 @@ function bindUi() {
   for (const ev of ["pointerup", "pointercancel", "pointerleave"]) cv.addEventListener(ev, () => (state.compare = false));
   window.addEventListener("resize", resizeView);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && !TEST && (!stream || !stream.active)) startCamera();
+    if (document.visibilityState === "visible") ensureCamera();
     keepAwake();
   });
 }
@@ -1189,6 +1327,50 @@ async function verifyEnhanced() {
   return { semAjustesProcessador: plain, comDefinicaoENitidez50: detail };
 }
 
+// MÁXIMA: a foto deitada com EXIF 6 tem de sair de pé e igual à LUT do Revelador,
+// pelo caminho do navegador e pelo giro no shader (com o EXIF arrancado do arquivo).
+async function verifyNative() {
+  await selectLut("raizen-33");
+  const keep = state.mix;
+  state.mix = 1;
+  const jpg = await (await fetch("teste/amostra-o6.jpg")).blob();
+  const ref = await loadImage("teste/ref-o6.png");
+  const cmp = (r) => {
+    if (r.w !== ref.naturalWidth || r.h !== ref.naturalHeight)
+      return { erro: `saiu ${r.w}×${r.h}, esperava ${ref.naturalWidth}×${ref.naturalHeight}` };
+    const c = document.createElement("canvas");
+    c.width = r.w; c.height = r.h;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(ref, 0, 0);
+    const a = ctx.getImageData(0, 0, r.w, r.h).data, b = readCanvas(r.canvas);
+    let s = 0, m = 0, big = 0;
+    for (let k = 0; k < a.length; k += 4)
+      for (let ch = 0; ch < 3; ch++) {
+        const d = Math.abs(a[k + ch] - b[k + ch]);
+        s += d; if (d > m) m = d; if (d > 4) big++;
+      }
+    return { largura: r.w, altura: r.h, diferencaMedia: +(s / (r.w * r.h * 3)).toFixed(3),
+             diferencaMaxima: m, canaisAcimaDe4: big };
+  };
+  const pelaGaleria = cmp(await lutPhoto(jpg));
+  const giroNoShader = cmp(await lutPhoto(await stripExif(jpg), { forceOrient: 6 }));
+  state.mix = keep;
+  return { navegadorGira: await browserRotates(), pelaGaleria, giroNoShader };
+}
+
+async function stripExif(blob) {
+  const b = new Uint8Array(await blob.arrayBuffer()), v = new DataView(b.buffer);
+  const parts = [b.subarray(0, 2)];
+  let p = 2;
+  while (p + 4 <= b.length && b[p] === 0xff && b[p + 1] !== 0xda) {
+    const len = v.getUint16(p + 2);
+    if (b[p + 1] !== 0xe1) parts.push(b.subarray(p, p + 2 + len));
+    p += 2 + len;
+  }
+  parts.push(b.subarray(p));
+  return new Blob(parts, { type: "image/jpeg" });
+}
+
 // ---------------------------------------------------------------- início
 async function main() {
   loadPrefs();
@@ -1203,7 +1385,8 @@ async function main() {
   if (!BUILTIN.find((b) => b.id === saved) && !luts.has(saved)) saved = "raizen-33";
   if (TEST) {
     testImage = await new Promise((ok) => { const i = new Image(); i.onload = () => ok(i); i.src = "teste/amostra.png"; });
-    Object.assign(window, { __verificar: verify, __testarHdr: verifyHdr, __testarFoto: verifyEnhanced, __estado: state });
+    Object.assign(window, { __verificar: verify, __testarHdr: verifyHdr, __testarFoto: verifyEnhanced,
+                            __testarMaxima: verifyNative, __estado: state });
   }
   await selectLut(saved);
   applyLight();
